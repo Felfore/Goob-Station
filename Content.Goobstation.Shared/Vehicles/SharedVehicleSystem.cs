@@ -4,6 +4,7 @@ using System.Numerics;
 using Content.Shared._vg.TileMovement;
 using Content.Shared.Access.Components;
 using Content.Shared.Access.Systems;
+using Content.Shared.Light.Components;
 using Content.Shared.Actions;
 using Content.Shared.Audio;
 using Content.Shared.Buckle;
@@ -39,6 +40,7 @@ public abstract partial class SharedVehicleSystem : EntitySystem
 
     private static readonly EntProtoId HornActionId = "ActionHorn";
     private static readonly EntProtoId SirenActionId = "ActionSiren";
+    private static readonly EntProtoId ToggleLightActionId = "ActionToggleLight";
 
     public override void Initialize()
     {
@@ -222,6 +224,8 @@ public abstract partial class SharedVehicleSystem : EntitySystem
             _actions.AddAction(driver, ref vehicleComp.HornAction, HornActionId, vehicle);
         if (vehicleComp.SirenSound != null)
             _actions.AddAction(driver, ref vehicleComp.SirenAction, SirenActionId, vehicle);
+        if (HasComp<UnpoweredFlashlightComponent>(vehicle))
+            _actions.AddAction(driver, ref vehicleComp.LightAction, ToggleLightActionId, vehicle);
     }
 
     private void Mount(EntityUid driver, EntityUid vehicle)
@@ -271,6 +275,8 @@ public abstract partial class SharedVehicleSystem : EntitySystem
             _actions.RemoveAction(driver, vehicleComp.HornAction);
         if (vehicleComp.SirenAction != null)
             _actions.RemoveAction(driver, vehicleComp.SirenAction);
+        if (vehicleComp.LightAction != null)
+            _actions.RemoveAction(driver, vehicleComp.LightAction);
 
         _virtualItem.DeleteInHandsMatching(driver, vehicle);
 
