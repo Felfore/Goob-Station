@@ -1,6 +1,5 @@
 using Content.Goobstation.Maths.FixedPoint;
 using Content.Shared.Actions;
-using Content.Shared.DoAfter;
 using Content.Shared.Audio;
 using Content.Shared.Buckle;
 using Content.Shared.Buckle.Components;
@@ -16,35 +15,23 @@ using Content.Shared.Fluids;
 using Content.Shared.Fluids.Components;
 using Content.Shared.Alert;
 using Content.Goobstation.Common.Footprints;
-using Content.Goobstation.Shared.Vehicles;
 using Robust.Shared.Audio;
 using Robust.Shared.Audio.Systems;
 using Robust.Shared.Containers;
 using Robust.Shared.GameObjects;
-using Content.Shared.Interaction.Events;
-using Content.Shared.Interaction;
 using Robust.Shared.GameStates;
 using Robust.Shared.Map;
 using Robust.Shared.Map.Components;
-using Robust.Shared.Network;
 using Robust.Shared.Prototypes;
 using Robust.Shared.Timing;
 using Robust.Shared.Utility;
 using System;
-using System.Collections.Generic;
 using System.Linq;
 using System.Numerics;
 
 namespace Content.Goobstation.Shared.Vehicles.FloorScrubber;
 
-/// <summary>
-///     Handles the core logic for floor scrubbers, including vacuuming puddles, cleaning decals,
-///     and managing internal solution tanks.
-/// </summary>
-/// <remarks>
-///     Goobstation - Refactor for modularity: Decoupled from vehicles to support Borgs and Automated Drones.
-/// </remarks>
-public abstract partial class SharedFloorScrubberSystem : EntitySystem
+public abstract class SharedFloorScrubberSystem : EntitySystem
 {
     [Dependency] private readonly SharedActionsSystem _actions = default!;
     [Dependency] private readonly SharedAmbientSoundSystem _ambientSound = default!;
@@ -60,174 +47,72 @@ public abstract partial class SharedFloorScrubberSystem : EntitySystem
     [Dependency] private readonly SharedPopupSystem _popup = default!;
     [Dependency] private readonly SharedTransformSystem _transform = default!;
     [Dependency] private readonly AlertsSystem _alerts = default!;
-    [Dependency] private readonly SharedDoAfterSystem _doAfter = default!;
-    [Dependency] private readonly INetManager _net = default!;
-    [Dependency] private readonly SharedAppearanceSystem _appearance = default!;
-
-    /// <summary>
-    ///     Pooled collection to prevent allocations during tile cleaning logic.
-    /// </summary>
-    private readonly HashSet<Vector2i> _targetTiles = new();
 
     public override void Initialize()
     {
         base.Initialize();
 
-        SubscribeLocalEvent<FloorScrubberComponent, FloorScrubberToggleActionEvent>(OnFloorScrubberToggleActionEvent);
-        SubscribeLocalEvent<FloorScrubberComponent, FloorScrubberDumpFloorActionEvent>(OnFloorScrubberDumpFloorActionEvent);
-        SubscribeLocalEvent<FloorScrubberComponent, FloorScrubberFillActionEvent>(OnFloorScrubberFillActionEvent);
-        SubscribeLocalEvent<FloorScrubberComponent, RefreshMovementSpeedModifiersEvent>(OnRefreshMovementSpeedModifiersEvent);
-        SubscribeLocalEvent<FloorScrubberComponent, ExaminedEvent>(OnExaminedEvent);
-        SubscribeLocalEvent<FloorScrubberComponent, StrappedEvent>(OnStrappedEvent);
-        SubscribeLocalEvent<FloorScrubberComponent, UnstrappedEvent>(OnUnstrappedEvent);
-        SubscribeLocalEvent<FloorScrubberComponent, EntInsertedIntoContainerMessage>(OnEntInsertedIntoContainerMessage);
-        SubscribeLocalEvent<FloorScrubberComponent, ComponentShutdown>(OnComponentShutdown);
-
-        // DoAfter Events
-        SubscribeLocalEvent<FloorScrubberComponent, FloorScrubberDumpFloorDoAfterEvent>(OnDumpFloorDoAfter);
-        SubscribeLocalEvent<FloorScrubberComponent, FloorScrubberFillDoAfterEvent>(OnFillDoAfter);
-
-        SubscribeLocalEvent<FloorScrubberToolComponent, UseInHandEvent>(OnUseInHandEvent);
-        SubscribeLocalEvent<FloorScrubberComponent, InteractUsingEvent>(OnInteractUsing);
+        SubscribeLocalEvent<FloorScrubberComponent, FloorScrubberToggleActionEvent>(OnToggleAction);
+        SubscribeLocalEvent<FloorScrubberComponent, FloorScrubberDumpFloorActionEvent>(OnDumpFloor);
+        SubscribeLocalEvent<FloorScrubberComponent, FloorScrubberFillActionEvent>(OnFill);
+        SubscribeLocalEvent<FloorScrubberComponent, RefreshMovementSpeedModifiersEvent>(OnRefreshSpeed);
+        SubscribeLocalEvent<FloorScrubberComponent, ExaminedEvent>(OnExamine);
+        SubscribeLocalEvent<FloorScrubberComponent, StrappedEvent>(OnStrapped);
+        SubscribeLocalEvent<FloorScrubberComponent, UnstrappedEvent>(OnUnstrapped);
+        SubscribeLocalEvent<FloorScrubberComponent, EntInsertedIntoContainerMessage>(OnInsert);
+        SubscribeLocalEvent<FloorScrubberComponent, ComponentShutdown>(OnShutdown);
     }
 
     /// <summary>
-    ///     Handles a driver buckling into the scrubber.
+    ///     Handles a driver buckling into the scrubber, granting actions and showing alerts.
     /// </summary>
-    private void OnStrappedEvent(Entity<FloorScrubberComponent> ent, ref StrappedEvent args)
+    private void OnStrapped(Entity<FloorScrubberComponent> ent, ref StrappedEvent args)
     {
-        UpdateOperators((ent.Owner, ent.Comp));
-    }
-
-    /// <summary>
-    ///     Handles a driver unbuckling.
-    /// </summary>
-    private void OnUnstrappedEvent(Entity<FloorScrubberComponent> ent, ref UnstrappedEvent args)
-    {
-        UpdateOperators((ent.Owner, ent.Comp));
-
-        if (ent.Comp.CleaningEnabled && ent.Comp.RequiresOperator && ent.Comp.ActiveOperators.Count == 0)
-            SetCleaningEnabled(ent.Owner, false);
-    }
-
-    /// <summary>
-    ///     Updates the list of active operators who should receive actions and alerts.
-    /// </summary>
-    public void UpdateOperators(Entity<FloorScrubberComponent?> ent)
-    {
-        if (!Resolve(ent, ref ent.Comp))
-            return;
-
-        var oldOperators = new HashSet<EntityUid>(ent.Comp.ActiveOperators);
-        ent.Comp.ActiveOperators.Clear();
-
-        // 1. Add buckled entities
-        if (TryComp<StrapComponent>(ent, out var strap))
-        {
-            foreach (var occupant in strap.BuckledEntities)
-            {
-                ent.Comp.ActiveOperators.Add(occupant);
-            }
-        }
-
-        // 1.5 Add self if SelfOperator is true
-        if (ent.Comp.SelfOperator)
-        {
-            ent.Comp.ActiveOperators.Add(ent.Owner);
-        }
-
-        // 2. Add handlers for removed operators
-        foreach (var oldOp in oldOperators)
-        {
-            if (!ent.Comp.ActiveOperators.Contains(oldOp))
-                RemoveOperatorEffects((ent.Owner, ent.Comp), oldOp);
-        }
-
-        // 3. Apply effects to new operators
-        foreach (var newOp in ent.Comp.ActiveOperators)
-        {
-            if (!oldOperators.Contains(newOp))
-                AddOperatorEffects((ent.Owner, ent.Comp), newOp);
-        }
+        var driver = args.Buckle.Owner;
+        _actions.AddAction(driver, ref ent.Comp.CleanAction, "ActionFloorScrubberToggle", ent);
+        _actions.AddAction(driver, ref ent.Comp.DumpDrainAction, "ActionFloorScrubberDumpDrain", ent);
+        _actions.AddAction(driver, ref ent.Comp.DumpFloorAction, "ActionFloorScrubberDumpFloor", ent);
+        _actions.AddAction(driver, ref ent.Comp.FillAction, "ActionFloorScrubberFill", ent);
 
         Dirty(ent);
+
+        // Immediately show alerts for the new driver.
         UpdateAlerts(ent.Owner);
     }
 
     /// <summary>
-    ///     Grants actions to an operator if not suppressed.
+    ///     Handles a driver unbuckling, removing actions and clearing alerts.
     /// </summary>
-    private void AddOperatorEffects(Entity<FloorScrubberComponent> ent, EntityUid operatorEnt)
+    private void OnUnstrapped(Entity<FloorScrubberComponent> ent, ref UnstrappedEvent args)
     {
-        if (ent.Comp.SuppressActions)
-            return;
+        var driver = args.Buckle.Owner;
+        _actions.RemoveAction(driver, ent.Comp.CleanAction);
+        _actions.RemoveAction(driver, ent.Comp.DumpDrainAction);
+        _actions.RemoveAction(driver, ent.Comp.DumpFloorAction);
+        _actions.RemoveAction(driver, ent.Comp.FillAction);
 
-        _actions.AddAction(operatorEnt, ref ent.Comp.CleanAction, "ActionFloorScrubberToggle", ent);
-        _actions.AddAction(operatorEnt, ref ent.Comp.DumpDrainAction, "ActionFloorScrubberDumpDrain", ent);
-        _actions.AddAction(operatorEnt, ref ent.Comp.DumpFloorAction, "ActionFloorScrubberDumpFloor", ent);
-        _actions.AddAction(operatorEnt, ref ent.Comp.FillAction, "ActionFloorScrubberFill", ent);
-    }
+        _alerts.ClearAlert(driver, "FloorScrubberClean");
+        _alerts.ClearAlert(driver, "FloorScrubberWaste");
 
-    /// <summary>
-    ///     Clears alerts and actions for an operator.
-    /// </summary>
-    private void RemoveOperatorEffects(Entity<FloorScrubberComponent> ent, EntityUid operatorEnt)
-    {
-        _actions.RemoveAction(operatorEnt, ent.Comp.CleanAction);
-        _actions.RemoveAction(operatorEnt, ent.Comp.DumpDrainAction);
-        _actions.RemoveAction(operatorEnt, ent.Comp.DumpFloorAction);
-        _actions.RemoveAction(operatorEnt, ent.Comp.FillAction);
-
-        _alerts.ClearAlert(operatorEnt, "FloorScrubberClean");
-        _alerts.ClearAlert(operatorEnt, "FloorScrubberWaste");
+        if (ent.Comp.CleaningEnabled)
+            SetCleaningEnabled(ent.Owner, false);
     }
 
     /// <summary>
     ///     Ensures clean-up of audio and alerts on component shutdown.
     /// </summary>
-    private void OnComponentShutdown(Entity<FloorScrubberComponent> ent, ref ComponentShutdown args)
+    private void OnShutdown(Entity<FloorScrubberComponent> ent, ref ComponentShutdown args)
     {
         UpdateCleaningAudio(ent, false);
 
-        foreach (var occupant in ent.Comp.ActiveOperators)
+        if (TryComp<StrapComponent>(ent, out var strap))
         {
-            _alerts.ClearAlert(occupant, "FloorScrubberClean");
-            _alerts.ClearAlert(occupant, "FloorScrubberWaste");
+            foreach (var occupant in strap.BuckledEntities)
+            {
+                _alerts.ClearAlert(occupant, "FloorScrubberClean");
+                _alerts.ClearAlert(occupant, "FloorScrubberWaste");
+            }
         }
-    }
-
-    /// <summary>
-    ///     Configures the scrubber for borg operation, bypassing vehicle requirements.
-    /// </summary>
-    public void SetupBorgMode(Entity<FloorScrubberComponent?> ent, BorgModuleFloorScrubberComponent module)
-    {
-        if (!Resolve(ent, ref ent.Comp))
-            return;
-
-        ent.Comp.RequiresKey = false;
-        ent.Comp.RequiresOperator = false;
-        ent.Comp.SelfOperator = true;
-        ent.Comp.SuppressActions = true;
-
-        ent.Comp.CleaningShape = module.CleaningShape;
-        ent.Comp.CleaningAmount = module.CleaningAmount;
-        ent.Comp.VacuumAmount = module.VacuumAmount;
-        ent.Comp.SpeedMultiplier = module.SpeedMultiplier;
-        ent.Comp.ExtraCleaningRange = module.ExtraCleaningRange;
-
-        Dirty(ent);
-    }
-
-    /// <summary>
-    ///     Removes borg-specific operational flags from the scrubber before removal.
-    /// </summary>
-    public void TeardownBorgMode(Entity<FloorScrubberComponent?> ent)
-    {
-        if (!Resolve(ent, ref ent.Comp))
-            return;
-
-        ent.Comp.SelfOperator = false;
-        Dirty(ent);
     }
 
     /// <summary>
@@ -246,13 +131,6 @@ public abstract partial class SharedFloorScrubberSystem : EntitySystem
 
         _movementSpeed.RefreshMovementSpeedModifiers(ent.Owner);
         Dirty(ent);
-
-        // Drive the cleaning animation overlay.
-        if (TryComp<VehicleComponent>(ent.Owner, out var vehicle) && vehicle.ActiveOverlay.HasValue)
-        {
-            var state = enabled ? FloorScrubberCleaningVisualState.On : FloorScrubberCleaningVisualState.Off;
-            _appearance.SetData(vehicle.ActiveOverlay.Value, FloorScrubberVisuals.Cleaning, state);
-        }
 
         // Update alerts to show/reset severity if we stopped due to a full tank etc.
         UpdateAlerts(ent.Owner);
@@ -289,7 +167,7 @@ public abstract partial class SharedFloorScrubberSystem : EntitySystem
     /// <summary>
     ///     Synchronizes cleaning audio state when a key is inserted.
     /// </summary>
-    private void OnEntInsertedIntoContainerMessage(Entity<FloorScrubberComponent> ent, ref EntInsertedIntoContainerMessage args)
+    private void OnInsert(Entity<FloorScrubberComponent> ent, ref EntInsertedIntoContainerMessage args)
     {
         // Only care about the key slot
         if (args.Container.ID != "key_slot")
@@ -300,56 +178,19 @@ public abstract partial class SharedFloorScrubberSystem : EntitySystem
     }
 
     /// <summary>
-    ///     Handles the usage of borg-held scrubber tools.
-    /// </summary>
-    private void OnUseInHandEvent(Entity<FloorScrubberToolComponent> ent, ref UseInHandEvent args)
-    {
-        if (args.Handled)
-            return;
-
-        var user = args.User;
-        if (!TryComp<FloorScrubberComponent>(user, out var scrub))
-            return;
-
-        switch (ent.Comp.Mode)
-        {
-            case FloorScrubberToolType.Toggle:
-                SetCleaningEnabled(user, !scrub.CleaningEnabled);
-                break;
-            case FloorScrubberToolType.Fill:
-                var fillEv = new FloorScrubberFillActionEvent { Performer = user };
-                OnFloorScrubberFillActionEvent((user, scrub), ref fillEv);
-                break;
-            case FloorScrubberToolType.DumpDrain:
-                var drainEv = new FloorScrubberDumpDrainActionEvent { Performer = user };
-                RaiseLocalEvent(user, drainEv);
-                break;
-            case FloorScrubberToolType.DumpFloor:
-                var dumpEv = new FloorScrubberDumpFloorActionEvent { Performer = user };
-                OnFloorScrubberDumpFloorActionEvent((user, scrub), ref dumpEv);
-                break;
-        }
-
-        args.Handled = true;
-    }
-
-    /// <summary>
     ///     Toggles the cleaning mode via action.
     /// </summary>
-    private void OnFloorScrubberToggleActionEvent(Entity<FloorScrubberComponent> ent, ref FloorScrubberToggleActionEvent args)
+    private void OnToggleAction(Entity<FloorScrubberComponent> ent, ref FloorScrubberToggleActionEvent args)
     {
         if (args.Handled)
             return;
 
-        // Key Check: Cannot toggle if the key slot is empty and requirements are met.
-        if (ent.Comp.RequiresKey)
+        // Key Check: Cannot toggle if the key slot is empty.
+        if (!_itemSlots.TryGetSlot(ent.Owner, "key_slot", out var slot) || !slot.HasItem)
         {
-            if (!_itemSlots.TryGetSlot(ent.Owner, "key_slot", out var slot) || !slot.HasItem)
-            {
-                if (_timing.IsFirstTimePredicted)
-                    _popup.PopupEntity(Loc.GetString("floor-scrubber-fill-no-key"), ent.Owner, args.Performer);
-                return;
-            }
+            if (_timing.IsFirstTimePredicted)
+                _popup.PopupEntity(Loc.GetString("floor-scrubber-fill-no-key"), ent.Owner, args.Performer);
+            return;
         }
 
         SetCleaningEnabled(ent.Owner, !ent.Comp.CleaningEnabled);
@@ -357,43 +198,14 @@ public abstract partial class SharedFloorScrubberSystem : EntitySystem
     }
 
     /// <summary>
-    ///     Initiates a do-after to dump the waste solution onto the floor.
+    ///     Dumps the waste solution onto the floor.
     /// </summary>
-    private void OnFloorScrubberDumpFloorActionEvent(Entity<FloorScrubberComponent> ent, ref FloorScrubberDumpFloorActionEvent args)
+    private void OnDumpFloor(Entity<FloorScrubberComponent> ent, ref FloorScrubberDumpFloorActionEvent args)
     {
         if (args.Handled)
             return;
 
         var user = args.Performer;
-
-        if (!_solutionContainer.TryGetSolution(ent.Owner, ent.Comp.WasteSolutionName, out var wasteSolnEnt, out var waste)
-            || waste.Volume <= 0)
-        {
-            if (_timing.IsFirstTimePredicted)
-                _popup.PopupEntity(Loc.GetString("floor-scrubber-dump-floor-empty"), ent.Owner, user);
-            return;
-        }
-
-        var doAfterArgs = new DoAfterArgs(EntityManager, user, 3f, new FloorScrubberDumpFloorDoAfterEvent(), ent.Owner)
-        {
-            BreakOnMove = true,
-            BreakOnDamage = true,
-            NeedHand = false,
-        };
-
-        _doAfter.TryStartDoAfter(doAfterArgs);
-        args.Handled = true;
-    }
-
-    /// <summary>
-    ///     Executes the dump floor action after the duration.
-    /// </summary>
-    private void OnDumpFloorDoAfter(Entity<FloorScrubberComponent> ent, ref FloorScrubberDumpFloorDoAfterEvent args)
-    {
-        if (args.Cancelled || args.Handled)
-            return;
-
-        var user = args.User;
 
         if (!_solutionContainer.TryGetSolution(ent.Owner, ent.Comp.WasteSolutionName, out var wasteSolnEnt, out var waste)
             || waste.Volume <= 0)
@@ -417,9 +229,9 @@ public abstract partial class SharedFloorScrubberSystem : EntitySystem
     }
 
     /// <summary>
-    ///     Initiates a do-after to refill the clean water tank from a nearby source.
+    ///     Refills the clean water tank from a nearby source.
     /// </summary>
-    private void OnFloorScrubberFillActionEvent(Entity<FloorScrubberComponent> ent, ref FloorScrubberFillActionEvent args)
+    private void OnFill(Entity<FloorScrubberComponent> ent, ref FloorScrubberFillActionEvent args)
     {
         if (args.Handled)
             return;
@@ -438,7 +250,7 @@ public abstract partial class SharedFloorScrubberSystem : EntitySystem
 
         // Find the nearest drainable water source (sink)
         var scrubberPos = _transform.GetMapCoordinates(ent.Owner);
-        EntityUid nearestSource = default;
+        Entity<ReagentTankComponent?> nearestSource = default;
         var nearestDist = float.MaxValue;
 
         foreach (var candidate in _lookup.GetEntitiesInRange<ReagentTankComponent>(scrubberPos, 1.5f))
@@ -451,67 +263,11 @@ public abstract partial class SharedFloorScrubberSystem : EntitySystem
             if (dist < nearestDist)
             {
                 nearestDist = dist;
-                nearestSource = candidate.Owner;
+                nearestSource = (candidate.Owner, candidate.Comp);
             }
         }
 
-        if (nearestSource == default)
-        {
-            if (_timing.IsFirstTimePredicted)
-                _popup.PopupEntity(Loc.GetString("floor-scrubber-fill-no-source"), ent.Owner, user);
-            return;
-        }
-
-        var doAfterArgs = new DoAfterArgs(EntityManager, user, 3f, new FloorScrubberFillDoAfterEvent(), ent.Owner)
-        {
-            BreakOnMove = true,
-            BreakOnDamage = true,
-            NeedHand = false,
-        };
-
-        _doAfter.TryStartDoAfter(doAfterArgs);
-        args.Handled = true;
-    }
-
-    /// <summary>
-    ///     Executes the fill tank action after the duration.
-    /// </summary>
-    private void OnFillDoAfter(Entity<FloorScrubberComponent> ent, ref FloorScrubberFillDoAfterEvent args)
-    {
-        if (args.Cancelled || args.Handled)
-            return;
-
-        var user = args.User;
-
-        if (!_solutionContainer.TryGetSolution(ent.Owner, ent.Comp.CleanSolutionName, out var cleanSolnEnt, out var cleanSoln))
-            return;
-
-        if (cleanSoln.AvailableVolume <= 0)
-        {
-            if (_timing.IsFirstTimePredicted)
-                _popup.PopupEntity(Loc.GetString("floor-scrubber-fill-full"), ent.Owner, user);
-            return;
-        }
-
-        // Find the nearest drainable water source (sink) AGAIN since time passed
-        var scrubberPos = _transform.GetMapCoordinates(ent.Owner);
-        EntityUid nearestSource = default;
-        var nearestDist = float.MaxValue;
-
-        foreach (var candidate in _lookup.GetEntitiesInRange<ReagentTankComponent>(scrubberPos, 1.5f))
-        {
-            if (!HasComp<DrainComponent>(candidate.Owner))
-                continue;
-
-            var dist = (_transform.GetWorldPosition(candidate.Owner) - _transform.GetWorldPosition(ent.Owner)).LengthSquared();
-            if (dist < nearestDist)
-            {
-                nearestDist = dist;
-                nearestSource = candidate.Owner;
-            }
-        }
-
-        if (nearestSource == default)
+        if (nearestSource.Owner == default)
         {
             if (_timing.IsFirstTimePredicted)
                 _popup.PopupEntity(Loc.GetString("floor-scrubber-fill-no-source"), ent.Owner, user);
@@ -519,7 +275,7 @@ public abstract partial class SharedFloorScrubberSystem : EntitySystem
         }
 
         // Drain from the source's drainable solution into the clean tank.
-        if (!_solutionContainer.TryGetDrainableSolution(nearestSource, out var sourceSolnEnt, out var sourceSoln))
+        if (!_solutionContainer.TryGetDrainableSolution(nearestSource.Owner, out var sourceSolnEnt, out var sourceSoln))
         {
             if (_timing.IsFirstTimePredicted)
                 _popup.PopupEntity(Loc.GetString("floor-scrubber-fill-no-source"), ent.Owner, user);
@@ -541,7 +297,7 @@ public abstract partial class SharedFloorScrubberSystem : EntitySystem
         {
             _audio.PlayPvs(new SoundPathSpecifier("/Audio/Effects/Fluids/glug.ogg"), ent.Owner);
             _popup.PopupEntity(Loc.GetString("floor-scrubber-fill-success",
-                ("source", Name(nearestSource))), ent.Owner, user);
+                ("source", Name(nearestSource.Owner))), ent.Owner, user);
         }
 
         args.Handled = true;
@@ -549,58 +305,9 @@ public abstract partial class SharedFloorScrubberSystem : EntitySystem
     }
 
     /// <summary>
-    ///     Intercepts interactions with containers to provide useful customized popups
-    ///     when attempting to pour or failing to draw. Let native DrainableSolution handle the core drawing.
-    /// </summary>
-    private void OnInteractUsing(Entity<FloorScrubberComponent> ent, ref InteractUsingEvent args)
-    {
-        if (args.Handled)
-            return;
-
-        var used = args.Used;
-        var user = args.User;
-
-        if (!_solutionContainer.TryGetDrainableSolution(ent.Owner, out _, out var wasteSoln))
-            return;
-
-        _solutionContainer.TryGetDrainableSolution(used, out _, out var bucketDrainSoln);
-        _solutionContainer.TryGetRefillableSolution(used, out _, out var bucketRefillSoln);
-
-        // Not a fluid container, ignore.
-        if (bucketDrainSoln == null && bucketRefillSoln == null)
-            return;
-
-        // Will the native system successfully draw waste into the bucket?
-        bool canDraw = wasteSoln.Volume > 0 && bucketRefillSoln != null && bucketRefillSoln.AvailableVolume > 0;
-        if (canDraw)
-            return; // Let the native system handle the successful interaction undisturbed.
-
-        // Native system will fail to draw. 
-        // Provide custom popups instead of generic ones.
-        
-        // If the container has capacity but the waste is empty, they are trying to draw.
-        if (wasteSoln.Volume <= 0 && bucketRefillSoln != null && bucketRefillSoln.AvailableVolume > 0)
-        {
-            if (_timing.IsFirstTimePredicted)
-                _popup.PopupEntity(Loc.GetString("floor-scrubber-waste-empty"), ent.Owner, user);
-            args.Handled = true;
-            return;
-        }
-
-        // If the container has liquid and they are using it on the scrubber, they are trying to pour.
-        if (bucketDrainSoln != null && bucketDrainSoln.Volume > 0)
-        {
-            if (_timing.IsFirstTimePredicted)
-                _popup.PopupEntity(Loc.GetString("floor-scrubber-refill-sink"), ent.Owner, user);
-            args.Handled = true;
-            return;
-        }
-    }
-
-    /// <summary>
     ///     Modifies movement speed based on whether the scrubber is cleaning.
     /// </summary>
-    private void OnRefreshMovementSpeedModifiersEvent(Entity<FloorScrubberComponent> ent, ref RefreshMovementSpeedModifiersEvent args)
+    private void OnRefreshSpeed(Entity<FloorScrubberComponent> ent, ref RefreshMovementSpeedModifiersEvent args)
     {
         if (ent.Comp.CleaningEnabled)
             args.ModifySpeed(ent.Comp.SpeedMultiplier, ent.Comp.SpeedMultiplier);
@@ -609,7 +316,7 @@ public abstract partial class SharedFloorScrubberSystem : EntitySystem
     /// <summary>
     ///     Adds information about tank levels to the examine tooltip.
     /// </summary>
-    private void OnExaminedEvent(Entity<FloorScrubberComponent> ent, ref ExaminedEvent args)
+    private void OnExamine(Entity<FloorScrubberComponent> ent, ref ExaminedEvent args)
     {
         if (_solutionContainer.TryGetSolution(ent.Owner, ent.Comp.CleanSolutionName, out _, out var cleanSoln))
         {
@@ -642,15 +349,8 @@ public abstract partial class SharedFloorScrubberSystem : EntitySystem
             if (!scrubber.CleaningEnabled)
                 continue;
 
-            // Key Check: Automatically stop cleaning if the key is removed and required.
-            if (scrubber.RequiresKey && (!_itemSlots.TryGetSlot(uid, "key_slot", out var slot) || !slot.HasItem))
-            {
-                SetCleaningEnabled(uid, false);
-                continue;
-            }
-
-            // Operator Check: Automatically stop if no operator is active and required.
-            if (scrubber.RequiresOperator && scrubber.ActiveOperators.Count == 0)
+            // Key Check: Automatically stop cleaning if the key is removed.
+            if (!_itemSlots.TryGetSlot(uid, "key_slot", out var slot) || !slot.HasItem)
             {
                 SetCleaningEnabled(uid, false);
                 continue;
@@ -677,7 +377,7 @@ public abstract partial class SharedFloorScrubberSystem : EntitySystem
         if (!Resolve(ent, ref ent.Comp))
             return;
 
-        if (ent.Comp.ActiveOperators.Count == 0)
+        if (!TryComp<StrapComponent>(ent, out var strap) || strap.BuckledEntities.Count == 0)
             return;
 
         if (!_solutionContainer.TryGetSolution(ent.Owner, ent.Comp.CleanSolutionName, out _, out var cleanSoln) ||
@@ -689,7 +389,7 @@ public abstract partial class SharedFloorScrubberSystem : EntitySystem
         var cleanSeverity = (short) Math.Clamp((float) (cleanSoln.Volume / cleanSoln.MaxVolume) * 10, 0, 10);
         var wasteSeverity = (short) Math.Clamp((float) (wasteSoln.Volume / wasteSoln.MaxVolume) * 10, 0, 10);
 
-        foreach (var occupant in ent.Comp.ActiveOperators)
+        foreach (var occupant in strap.BuckledEntities)
         {
             _alerts.ShowAlert(occupant, "FloorScrubberClean", cleanSeverity);
             _alerts.ShowAlert(occupant, "FloorScrubberWaste", wasteSeverity);
@@ -723,8 +423,7 @@ public abstract partial class SharedFloorScrubberSystem : EntitySystem
         }
 
         // 1. Determine which tiles we are cleaning.
-        _targetTiles.Clear();
-        var targetTiles = _targetTiles;
+        var targetTiles = new HashSet<Vector2i>();
         var centerTile = _map.LocalToTile(gridUid, grid, xform.Coordinates);
         var range = scrubber.ExtraCleaningRange;
 
@@ -752,28 +451,22 @@ public abstract partial class SharedFloorScrubberSystem : EntitySystem
                 break;
 
             case FloorScrubberShape.Line:
-            case FloorScrubberShape.Frontal:
                 targetTiles.Add(centerTile);
-                // Calculate direction relative to the grid rotation.
-                var gridRot = _transform.GetWorldRotation(gridUid);
-                var entRot = _transform.GetWorldRotation(ent.Owner);
-                var relativeRot = entRot - gridRot;
-
-                if (scrubber.CleaningShape == FloorScrubberShape.Frontal)
-                    relativeRot -= Angle.FromDegrees(90);
-
-                var dirVec = relativeRot.ToVec();
+                // Calculate perpendicular direction based on scrubber rotation.
+                var rotation = _transform.GetWorldRotation(ent.Owner);
+                var worldVec = rotation.ToVec();
+                var perpDir = new Vector2(-worldVec.Y, worldVec.X);
+                // Snap to best cardinal for logic simplicity on grid.
                 var step = Vector2i.Zero;
-                if (Math.Abs(dirVec.X) > Math.Abs(dirVec.Y))
-                    step = new Vector2i(dirVec.X > 0 ? 1 : -1, 0);
+                if (Math.Abs(perpDir.X) > Math.Abs(perpDir.Y))
+                    step = new Vector2i(perpDir.X > 0 ? 1 : -1, 0);
                 else
-                    step = new Vector2i(0, dirVec.Y > 0 ? 1 : -1);
+                    step = new Vector2i(0, perpDir.Y > 0 ? 1 : -1);
 
                 for (var i = 1; i <= range; i++)
                 {
                     targetTiles.Add(centerTile + step * i);
-                    if (scrubber.CleaningShape == FloorScrubberShape.Line)
-                        targetTiles.Add(centerTile - step * i);
+                    targetTiles.Add(centerTile - step * i);
                 }
                 break;
         }
@@ -824,29 +517,22 @@ public abstract partial class SharedFloorScrubberSystem : EntitySystem
                     }
                 }
 
-                // Apply changes to unpredicted entities ONLY on the server to prevent visual desync/flicker.
-                if (_net.IsServer)
+                if (isFootprint)
                 {
-                    if (isFootprint)
+                    RaiseLocalEvent(entity, new FootprintCleanEvent());
+                    changed = true;
+                }
+
+                // 2. Vacuum Puddle solutions
+                if (TryComp<PuddleComponent>(entity, out var puddle) &&
+                    _solutionContainer.TryGetSolution(entity, "puddle", out var puddleSolnEnt, out var puddleSolution))
+                {
+                    var drawAmount = FixedPoint2.Min(scrubber.VacuumAmount, puddleSolution.Volume, wasteSolution.AvailableVolume);
+                    if (drawAmount > 0)
                     {
-                        RaiseLocalEvent(entity, new FootprintCleanEvent());
+                        var removed = _solutionContainer.SplitSolution(puddleSolnEnt.Value, drawAmount);
+                        _solutionContainer.TryAddSolution(wasteSolnEnt.Value, removed);
                         changed = true;
-                    }
-
-                    // 2. Vacuum Puddle solutions
-                    if (TryComp<PuddleComponent>(entity, out var puddle) &&
-                        _solutionContainer.TryGetSolution(entity, "puddle", out var puddleSolnEnt, out var puddleSolution))
-                    {
-                        var drawAmount = FixedPoint2.Min(scrubber.VacuumAmount, puddleSolution.Volume, wasteSolution.AvailableVolume);
-                        if (drawAmount > 0)
-                        {
-                            var removed = _solutionContainer.SplitSolution(puddleSolnEnt.Value, drawAmount);
-                            _solutionContainer.TryAddSolution(wasteSolnEnt.Value, removed);
-                            changed = true;
-
-                            if (puddleSolution.Volume <= 0)
-                                QueueDel(entity);
-                        }
                     }
                 }
             }
@@ -862,7 +548,7 @@ public abstract partial class SharedFloorScrubberSystem : EntitySystem
             {
                 // We keep a consistent small amount (e.g., 2u) in the print tank to draw from.
                 var targetAmount = FixedPoint2.New(2);
-
+                
                 if (printSolnEnt.Value.Comp.Solution.Volume < targetAmount)
                 {
                     var amount = FixedPoint2.Min(targetAmount - printSolnEnt.Value.Comp.Solution.Volume, cleanSolution.Volume);
@@ -878,20 +564,17 @@ public abstract partial class SharedFloorScrubberSystem : EntitySystem
             var decals = _decal.GetDecalsInRange(gridUid, centerTileLocal, lookupRadius);
             var anyCleaned = false;
 
-            if (_net.IsServer)
+            foreach (var (decalId, decal) in decals)
             {
-                foreach (var (decalId, decal) in decals)
-                {
-                    if (!decal.Cleanable)
-                        continue;
+                if (!decal.Cleanable)
+                    continue;
 
-                    var decalPos = _map.LocalToTile(gridUid, grid, new EntityCoordinates(gridUid, decal.Coordinates));
-                    if (!targetTiles.Contains(decalPos))
-                        continue;
+                var decalPos = _map.LocalToTile(gridUid, grid, new EntityCoordinates(gridUid, decal.Coordinates));
+                if (!targetTiles.Contains(decalPos))
+                    continue;
 
-                    _decal.RemoveDecal(gridUid, decalId);
-                    anyCleaned = true;
-                }
+                _decal.RemoveDecal(gridUid, decalId);
+                anyCleaned = true;
             }
 
             if (anyCleaned)
